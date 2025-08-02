@@ -1,1 +1,115 @@
+import MetaTrader5 as mt5
+import pandas as pd
+import time
+import traceback
+import datetime
+import os
+import json
+
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY"]
+TIMEFRAME = mt5.TIMEFRAME_H1
+BARS = 300  # Historical bars to fetch
+DATA_FOLDER = "market_data"
+ECONOMIC_FLAGS_FILE = "economic_flags.json"
+
+# Initialize folder
+os.makedirs(DATA_FOLDER, exist_ok=True)
+
+
+def initialize_mt5():
+    if not mt5.initialize():
+        raise ConnectionError(f"MT5 Init Failed: {mt5.last_error()}")
+
+
+def shutdown_mt5():
+    mt5.shutdown()
+
+
+def read_economic_flags():
+    try:
+        with open(ECONOMIC_FLAGS_FILE, 'r') as f:
+            flags = json.load(f)
+        return flags
+    except Exception:
+        return {sym: False for sym in SYMBOLS}
+
+
+def get_data(symbol, bars):
+    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, bars)
+    if rates is None:
+        raise ValueError(f"No data for {symbol}")
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('time', inplace=True)
+    return df
+
+
+def compute_indicators(df):
+    # Momentum
+    df["returns"] = df["close"].pct_change()
+    df["momentum"] = df["close"] - df["close"].shift(10)
+
+    # Volatility
+    df["volatility"] = df["returns"].rolling(14).std()
+
+    # Simple MA
+    df["ma_20"] = df["close"].rolling(20).mean()
+    df["ma_50"] = df["close"].rolling(50).mean()
+
+    # RSI
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    return df.dropna()
+
+
+def validate_data(df):
+    if df.isnull().sum().sum() > 0:
+        raise ValueError("Data contains nulls")
+    if df.empty:
+        raise ValueError("Data is empty")
+    return True
+
+
+def save_data(df, symbol):
+    file_path = os.path.join(DATA_FOLDER, f"{symbol}_H1.csv")
+    df.to_csv(file_path)
+
+
+def run_data_ingestion():
+    initialize_mt5()
+    print("[Module A] MT5 Initialized")
+
+    econ_flags = read_economic_flags()
+
+    for symbol in SYMBOLS:
+        try:
+            if econ_flags.get(symbol, False):
+                print(f"[Module A] Skipping {symbol} due to economic filter")
+                continue
+
+            print(f"[Module A] Fetching {symbol}")
+            df = get_data(symbol, BARS)
+
+            validate_data(df)
+            df = compute_indicators(df)
+            save_data(df, symbol)
+
+            print(f"[Module A] {symbol} data saved with {len(df)} rows.")
+
+        except Exception as e:
+            print(f"[Module A] Error for {symbol}: {e}")
+            traceback.print_exc()
+
+    shutdown_mt5()
+    print("[Module A] Shutdown complete.")
+
+
+if __name__ == "__main__":
+    run_data_ingestion()
 
