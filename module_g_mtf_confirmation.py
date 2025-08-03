@@ -1,96 +1,69 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
+import json
+import redis
 import time
-import logging
 from ta.trend import MACD
 from ta.momentum import RSIIndicator
-from ta.momentum import StochasticOscillator
-
-# Logger setup
-logging.basicConfig(filename="module_g_mtf_confirmation.log", level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 TIMEFRAMES = {
     "M5": mt5.TIMEFRAME_M5,
     "M15": mt5.TIMEFRAME_M15,
-    "H1": mt5.TIMEFRAME_H1
+    "H1": mt5.TIMEFRAME_H1,
 }
 
 class MTFConfirmation:
-    def __init__(self, symbol="EURUSD", lookback=100):
+    def __init__(self, symbol="EURUSD", lookback=100, redis_host="localhost", redis_port=6379):
         self.symbol = symbol
         self.lookback = lookback
+        self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
         if not mt5.initialize():
-            logging.error("Failed to initialize MetaTrader5 connection")
-            raise Exception("MT5 connection failed")
-
-    def shutdown(self):
-        mt5.shutdown()
+            raise ConnectionError("MetaTrader5 initialization failed.")
 
     def get_data(self, timeframe):
         rates = mt5.copy_rates_from_pos(self.symbol, timeframe, 0, self.lookback)
-        if rates is None or len(rates) == 0:
-            logging.warning(f"Empty rates from MT5 for {self.symbol} - {timeframe}")
-            return None
         df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df['time'] = pd.to_datetime(df['time'], unit='s')
         return df
 
     def compute_indicators(self, df):
-        df['ma_fast'] = df['close'].rolling(window=5).mean()
-        df['ma_slow'] = df['close'].rolling(window=20).mean()
-
-        macd = MACD(df['close'])
-        df['macd'] = macd.macd()
-        df['macd_signal'] = macd.macd_signal()
-
-        rsi = RSIIndicator(df['close'])
-        df['rsi'] = rsi.rsi()
-
-        df['momentum'] = df['close'].diff()
-
+        df['macd'] = MACD(df['close']).macd()
+        df['rsi'] = RSIIndicator(df['close']).rsi()
+        df['momentum'] = df['close'] - df['close'].shift(4)
+        df.dropna(inplace=True)
         return df
 
     def determine_trend(self, df):
-        if df is None or len(df) < 25:
-            return "neutral", 0
-
         df = self.compute_indicators(df)
+        recent = df.iloc[-1]
+        score = 0
 
-        trend_score = 0
-
-        # MA Slope
-        if df['ma_fast'].iloc[-1] > df['ma_slow'].iloc[-1]:
-            trend_score += 1
+        if recent['macd'] > 0:
+            score += 1
         else:
-            trend_score -= 1
+            score -= 1
 
-        # MACD
-        if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1]:
-            trend_score += 1
+        if recent['rsi'] > 55:
+            score += 1
+        elif recent['rsi'] < 45:
+            score -= 1
+
+        if recent['momentum'] > 0:
+            score += 1
         else:
-            trend_score -= 1
+            score -= 1
 
-        # RSI
-        if df['rsi'].iloc[-1] > 55:
-            trend_score += 1
-        elif df['rsi'].iloc[-1] < 45:
-            trend_score -= 1
-
-        # Momentum
-        if df['momentum'].iloc[-1] > 0:
-            trend_score += 1
+        if score >= 2:
+            trend = "bullish"
+        elif score <= -2:
+            trend = "bearish"
         else:
-            trend_score -= 1
+            trend = "neutral"
 
-        if trend_score >= 2:
-            return "bullish", trend_score
-        elif trend_score <= -2:
-            return "bearish", trend_score
-        else:
-            return "neutral", trend_score
+        return trend, score
 
-    def confirm_signal(self, signal_direction: str):
+    def confirm_signal(self, signal_direction: str, signal_type: str = "momentum"):
         confirmation = True
         trend_summary = {}
         score_sum = 0
@@ -101,54 +74,63 @@ class MTFConfirmation:
             trend_summary[label] = {"trend": trend, "score": score}
             score_sum += score
 
-            if signal_direction == "buy" and trend != "bullish":
-                confirmation = False
-            elif signal_direction == "sell" and trend != "bearish":
-                confirmation = False
+            if signal_type == "momentum":
+                if signal_direction == "buy" and trend != "bullish":
+                    confirmation = False
+                elif signal_direction == "sell" and trend != "bearish":
+                    confirmation = False
+
+            elif signal_type == "reversal":
+                if signal_direction == "buy" and trend == "bearish":
+                    confirmation = True
+                elif signal_direction == "sell" and trend == "bullish":
+                    confirmation = True
+                else:
+                    confirmation = False
+
+            elif signal_type == "breakout":
+                if abs(score) < 3:
+                    confirmation = False
+
+            elif signal_type == "news":
+                if "H1" in trend_summary:
+                    if abs(trend_summary["H1"]["score"]) >= 3:
+                        confirmation = True
+                    else:
+                        confirmation = False
 
         return {
             "confirmed": confirmation,
             "overall_score": score_sum,
-            "trend_summary": trend_summary
+            "trend_summary": trend_summary,
+            "signal_direction": signal_direction,
+            "signal_type": signal_type,
+            "symbol": self.symbol
         }
 
-    def loop_for_signal_verification(self, signal_queue, output_queue):
-        logging.info("✅ MTF confirmation loop started.")
+    def process_queue(self):
+        print("🔁 [MTF Confirmation] Waiting for signals from Redis queue...")
         while True:
-            if not signal_queue.empty():
-                signal = signal_queue.get()
-                signal_id = signal.get("id", "unknown")
-                symbol = signal.get("symbol", "EURUSD")
-                direction = signal.get("direction", "").lower()
-
-                self.symbol = symbol
-                result = self.confirm_signal(direction)
-
-                output = {
-                    "signal_id": signal_id,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "confirmed": result["confirmed"],
-                    "score": result["overall_score"],
-                    "trend_summary": result["trend_summary"]
-                }
-
-                output_queue.put(output)
-
-                if result["confirmed"]:
-                    logging.info(f"✅ Signal {signal_id} CONFIRMED by MTF")
+            try:
+                job = self.redis.blpop("queue:signals:confirm", timeout=5)
+                if job:
+                    _, payload = job
+                    signal_data = json.loads(payload)
+                    self.symbol = signal_data.get("symbol", "EURUSD")
+                    result = self.confirm_signal(
+                        signal_direction=signal_data["signal_direction"],
+                        signal_type=signal_data.get("signal_type", "momentum")
+                    )
+                    self.redis.rpush("queue:signals:confirmed", json.dumps(result))
+                    print(f"✅ Confirmed signal: {result}")
                 else:
-                    logging.info(f"❌ Signal {signal_id} REJECTED by MTF")
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("🛑 Shutdown requested.")
+                break
+            except Exception as e:
+                print(f"⚠️ Error processing signal: {e}")
+                continue
 
-            time.sleep(1)
-
-    def socket_ready_stub(self, data):
-        """
-        Optional: Replace this with actual socket logic to bridge to brokers or APIs.
-        Example placeholder for sending data to another Python service or broker endpoint.
-        """
-        try:
-            # TODO: Use socket/socket.io/REST to send data to external system
-            logging.info(f"[Socket Relay] → {data}")
-        except Exception as e:
-            logging.error(f"Socket relay error: {e}")
+    def shutdown(self):
+        mt5.shutdown()
